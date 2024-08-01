@@ -26,7 +26,7 @@ from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 
 
-class DataPruningExperimentor:
+class DatasetPruner:
     method_name='default'
     def __init__(
             self,

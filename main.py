@@ -6,7 +6,7 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm import utils
 
-from pruner.dataset_pruner import DataPruningExperimentor
+from pruner.dataset_pruner import DatasetPruner
 
 
 try:
@@ -359,7 +359,7 @@ group.add_argument('--log-wandb', action='store_true', default=False,
 
 
 def main():
-    exp = DataPruningExperimentor(
+    exp = DatasetPruner(
             logger=_logger,
             config_parser=config_parser,
             parser=parser,
