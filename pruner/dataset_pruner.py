@@ -17,13 +17,16 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm import utils
-from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
+from timm.data import create_dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
+
+from .data.indexed_dataset import get_indexed_dataset
+from .data.loader import create_loader
 
 
 class DatasetPruner:
@@ -85,7 +88,7 @@ class DatasetPruner:
                 num_classes=-1,  # force head adaptation
             )
         
-        data_config, num_aug_splits = self.set_model(in_chans, has_apex, use_amp, factory_kwargs)
+        self.set_model(in_chans, has_apex, use_amp, factory_kwargs)
 
         self.set_learning_rate()
 
@@ -103,21 +106,29 @@ class DatasetPruner:
 
         self.set_distributed_training(has_apex, use_amp, has_compile)
 
-        self.create_train_and_eval_datasets(data_config)
+        self.create_train_and_eval_datasets()
 
-        collate_fn, mixup_active = self.set_mixup_and_cutmix(num_aug_splits)
+        mixup_active = self.set_mixup_and_cutmix()
 
-        self.wrap_dataset_with_augmix_helper(num_aug_splits)
+        self.wrap_dataset_with_augmix_helper()
 
-        self.create_data_loaders_with_augmentation_pipeline(data_config, num_aug_splits, collate_fn)
+        self.create_data_loaders_with_augmentation_pipeline()
         
-        self.set_loss_function(num_aug_splits, mixup_active)
+        self.set_loss_function(mixup_active)
 
-        decreasing_metric = self.set_checkpoint_saver_and_eval_metric_tracking(args_text, data_config, has_wandb)
+        decreasing_metric = self.set_checkpoint_saver_and_eval_metric_tracking(args_text, has_wandb)
 
         self.set_learning_rate_schedule_and_starting_epoch(
             decreasing_metric=decreasing_metric,
             resume_epoch=resume_epoch)
+
+        self.results = []
+
+        # dataset pruning statistics
+        self.num_used_samples = 0
+        self.num_full_samples = 0
+        self.num_train_samples = len(self.train_dataset)
+    
 
     def _parse_args(self, config_parser, parser):
         # Do we have a config file to parse?
@@ -187,18 +198,18 @@ class DatasetPruner:
             self.logger.info(
                 f'Model {safe_model_name(self.args.model)} created, param count:{sum([m.numel() for m in self.model.parameters()])}')
 
-        data_config = resolve_data_config(vars(self.args), model=self.model, verbose=utils.is_primary(self.args))
+        self.data_config = resolve_data_config(vars(self.args), model=self.model, verbose=utils.is_primary(self.args))
 
         # setup augmentation batch splits for contrastive loss or split bn
-        num_aug_splits = 0
+        self.num_aug_splits = 0
         if self.args.aug_splits > 0:
             assert self.args.aug_splits > 1, 'A split of 1 makes no sense'
             num_aug_splits = self.args.aug_splits
 
         # enable split bn (separate bn stats per batch-portion)
         if self.args.split_bn:
-            assert num_aug_splits > 1 or self.args.resplit
-            self.model = convert_splitbn_model(self.model, max(num_aug_splits, 2))
+            assert self.num_aug_splits > 1 or self.args.resplit
+            self.model = convert_splitbn_model(self.model, max(self.num_aug_splits, 2))
 
         # move model to GPU, enable channels last layout if set
         self.model.to(device=self.device)
@@ -225,8 +236,6 @@ class DatasetPruner:
             assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
             assert not self.args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
             self.model = torch.jit.script(self.model)
-
-        return data_config, num_aug_splits
 
     def set_learning_rate(self):
         if not self.args.lr:
@@ -315,29 +324,50 @@ class DatasetPruner:
             assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
             model = torch.compile(self.model, backend=self.args.torchcompile)
 
-    def create_train_and_eval_datasets(self, data_config):
+    def create_train_and_eval_datasets(self):
         if self.args.data and not self.args.data_dir:
             self.args.data_dir = self.args.data
         if self.args.input_img_mode is None:
-            input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
+            input_img_mode = 'RGB' if self.data_config['input_size'][0] == 3 else 'L'
         else:
             input_img_mode = self.args.input_img_mode
 
-        self.train_dataset = create_dataset(
-            self.args.dataset,
-            root=self.args.data_dir,
-            split=self.args.train_split,
-            is_training=True,
-            class_map=self.args.class_map,
-            download=self.args.dataset_download,
-            batch_size=self.args.batch_size,
-            seed=self.args.seed,
-            repeats=self.args.epoch_repeats,
-            input_img_mode=input_img_mode,
-            input_key=self.args.input_key,
-            target_key=self.args.target_key,
-            num_samples=self.args.train_num_samples,
-        )
+        args = [self.args.dataset]
+
+        kwargs = {
+            'root': self.args.data_dir,
+            'split': self.args.train_split,
+            'is_training': True,
+            'class_map': self.args.class_map,
+            'download': self.args.dataset_download,
+            'batch_size': self.args.batch_size,
+            'seed': self.args.seed,
+            'repeats': self.args.epoch_repeats,
+            'input_img_mode': input_img_mode,
+            'input_key': self.args.input_key,
+            'target_key': self.args.target_key,
+            'num_samples': self.args.train_num_samples,
+        }
+
+        # train_dataset = create_dataset(
+        #     self.args.dataset,
+        #     root=self.args.data_dir,
+        #     split=self.args.train_split,
+        #     is_training=True,
+        #     class_map=self.args.class_map,
+        #     download=self.args.dataset_download,
+        #     batch_size=self.args.batch_size,
+        #     seed=self.args.seed,
+        #     repeats=self.args.epoch_repeats,
+        #     input_img_mode=input_img_mode,
+        #     input_key=self.args.input_key,
+        #     target_key=self.args.target_key,
+        #     num_samples=self.args.train_num_samples,
+        # )
+
+        train_dataset = create_dataset(*args, **kwargs)
+
+        self.train_dataset = get_indexed_dataset(train_dataset, *args, **kwargs)
 
         if self.args.val_split:
             self.val_dataset = create_dataset(
@@ -354,8 +384,8 @@ class DatasetPruner:
                 num_samples=self.args.val_num_samples,
             )
 
-    def set_mixup_and_cutmix(self, num_aug_splits):
-        collate_fn = None
+    def set_mixup_and_cutmix(self):
+        self.collate_fn = None
         self.mixup_fn = None
         mixup_active = self.args.mixup > 0 or self.args.cutmix > 0. or self.args.cutmix_minmax is not None
         if mixup_active:
@@ -370,24 +400,24 @@ class DatasetPruner:
                 num_classes=self.args.num_classes
             )
             if self.args.prefetcher:
-                assert not num_aug_splits  # collate conflict (need to support de-interleaving in collate mixup)
-                collate_fn = FastCollateMixup(**mixup_args)
+                assert not self.num_aug_splits  # collate conflict (need to support de-interleaving in collate mixup)
+                self.collate_fn = FastCollateMixup(**mixup_args)
             else:
                 self.mixup_fn = Mixup(**mixup_args)
 
-        return collate_fn, mixup_active
+        return mixup_active
 
-    def wrap_dataset_with_augmix_helper(self, num_aug_splits):
-        if num_aug_splits > 1:
-            dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+    def wrap_dataset_with_augmix_helper(self):
+        if self.num_aug_splits > 1:
+            dataset_train = AugMixDataset(dataset_train, num_splits=self.num_aug_splits)
 
-    def create_data_loaders_with_augmentation_pipeline(self, data_config, num_aug_splits, collate_fn):
+    def create_data_loaders_with_augmentation_pipeline(self):
         train_interpolation = self.args.train_interpolation
         if self.args.no_aug or not train_interpolation:
-            train_interpolation = data_config['interpolation']
+            train_interpolation = self.data_config['interpolation']
         self.train_loader = create_loader(
             self.train_dataset,
-            input_size=data_config['input_size'],
+            input_size=self.data_config['input_size'],
             batch_size=self.args.batch_size,
             is_training=True,
             no_aug=self.args.no_aug,
@@ -406,13 +436,13 @@ class DatasetPruner:
             gaussian_blur_prob=self.args.gaussian_blur_prob,
             auto_augment=self.args.aa,
             num_aug_repeats=self.args.aug_repeats,
-            num_aug_splits=num_aug_splits,
+            num_aug_splits=self.num_aug_splits,
             interpolation=train_interpolation,
-            mean=data_config['mean'],
-            std=data_config['std'],
+            mean=self.data_config['mean'],
+            std=self.data_config['std'],
             num_workers=self.args.workers,
             distributed=self.args.distributed,
-            collate_fn=collate_fn,
+            collate_fn=self.collate_fn,
             pin_memory=self.args.pin_mem,
             device=self.device,
             use_prefetcher=self.args.prefetcher,
@@ -428,25 +458,25 @@ class DatasetPruner:
                 eval_workers = min(2, self.args.workers)
             self.val_loader = create_loader(
                 self.val_dataset,
-                input_size=data_config['input_size'],
+                input_size=self.data_config['input_size'],
                 batch_size=self.args.validation_batch_size or self.args.batch_size,
                 is_training=False,
-                interpolation=data_config['interpolation'],
-                mean=data_config['mean'],
-                std=data_config['std'],
+                interpolation=self.data_config['interpolation'],
+                mean=self.data_config['mean'],
+                std=self.data_config['std'],
                 num_workers=eval_workers,
                 distributed=self.args.distributed,
-                crop_pct=data_config['crop_pct'],
+                crop_pct=self.data_config['crop_pct'],
                 pin_memory=self.args.pin_mem,
                 device=self.device,
                 use_prefetcher=self.args.prefetcher,
             )
 
-    def set_loss_function(self, num_aug_splits, mixup_active):
+    def set_loss_function(self, mixup_active):
 
         if self.args.jsd_loss:
-            assert num_aug_splits > 1  # JSD only valid with aug splits set
-            self.train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=self.args.smoothing)
+            assert self.num_aug_splits > 1  # JSD only valid with aug splits set
+            self.train_loss_fn = JsdCrossEntropy(num_splits=self.num_aug_splits, smoothing=self.args.smoothing)
         elif mixup_active:
             # smoothing is handled with mixup target transform which outputs sparse, soft targets
             if self.args.bce_loss:
@@ -468,11 +498,11 @@ class DatasetPruner:
             else:
                 self.train_loss_fn = LabelSmoothingCrossEntropy(smoothing=self.args.smoothing)
         else:
-            self.train_loss_fn = nn.CrossEntropyLoss()
+            self.train_loss_fn = nn.CrossEntropyLoss(reduction='none')
         self.train_loss_fn = self.train_loss_fn.to(device=self.device)
         self.val_loss_fn = nn.CrossEntropyLoss().to(device=self.device)
 
-    def set_checkpoint_saver_and_eval_metric_tracking(self, args_text, data_config, has_wandb):
+    def set_checkpoint_saver_and_eval_metric_tracking(self, args_text, has_wandb):
 
         self.eval_metric = self.args.eval_metric if self.val_loader is not None else 'loss'
         decreasing_metric = self.eval_metric == 'loss'
@@ -487,7 +517,7 @@ class DatasetPruner:
                 exp_name = '-'.join([
                     datetime.now().strftime("%Y%m%d-%H%M%S"),
                     safe_model_name(self.args.model),
-                    str(data_config['input_size'][-1])
+                    str(self.data_config['input_size'][-1])
                 ])
             self.output_dir = utils.get_outdir(self.args.output if self.args.output else './output/train', exp_name)
             self.saver = utils.CheckpointSaver(
@@ -546,7 +576,11 @@ class DatasetPruner:
         pass
 
     def before_epoch(self, epoch):
-        pass
+        
+        self.num_used_samples += self.num_train_samples
+        self.num_full_samples += self.num_train_samples
+
+        return None
 
     def after_epoch(self, epoch):
         pass
@@ -557,8 +591,54 @@ class DatasetPruner:
     def after_batch(self):
         pass
 
-    def while_update(self):
-        pass
+    def while_update(self, loss, indexes=None):
+        loss = torch.mean(loss)
+        return loss
+
+    def create_pruned_loader(self, train_indices=None):
+
+        if train_indices is None:
+            pruned_dataset = self.train_dataset
+        else:
+            pruned_dataset = torch.utils.data.Subset(self.train_dataset, train_indices)
+
+        train_interpolation = self.args.train_interpolation
+        if self.args.no_aug or not train_interpolation:
+            train_interpolation = self.data_config['interpolation']
+        self.train_loader = create_loader(
+            pruned_dataset,
+            input_size=self.data_config['input_size'],
+            batch_size=self.args.batch_size,
+            is_training=True,
+            no_aug=self.args.no_aug,
+            re_prob=self.args.reprob,
+            re_mode=self.args.remode,
+            re_count=self.args.recount,
+            re_split=self.args.resplit,
+            train_crop_mode=self.args.train_crop_mode,
+            scale=self.args.scale,
+            ratio=self.args.ratio,
+            hflip=self.args.hflip,
+            vflip=self.args.vflip,
+            color_jitter=self.args.color_jitter,
+            color_jitter_prob=self.args.color_jitter_prob,
+            grayscale_prob=self.args.grayscale_prob,
+            gaussian_blur_prob=self.args.gaussian_blur_prob,
+            auto_augment=self.args.aa,
+            num_aug_repeats=self.args.aug_repeats,
+            num_aug_splits=self.num_aug_splits,
+            interpolation=train_interpolation,
+            mean=self.data_config['mean'],
+            std=self.data_config['std'],
+            num_workers=self.args.workers,
+            distributed=self.args.distributed,
+            collate_fn=self.collate_fn,
+            pin_memory=self.args.pin_mem,
+            device=self.device,
+            use_prefetcher=self.args.prefetcher,
+            use_multi_epochs_loader=self.args.use_multi_epochs_loader,
+            worker_seeding=self.args.worker_seeding,
+        )
 
     def train_one_epoch(
             self,
@@ -577,9 +657,6 @@ class DatasetPruner:
             model_ema=None,
             mixup_fn=None,
             num_updates_total=None):
-
-        # TODO: pruned dataset loader 구성하도록 하기 (나중에 하기)
-        pass
 
         if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
             if args.prefetcher and loader.mixup_enabled:
@@ -605,7 +682,8 @@ class DatasetPruner:
         data_start_time = update_start_time = time.time()
         optimizer.zero_grad()
         update_sample_count = 0
-        for batch_idx, (input, target) in enumerate(loader):
+        # for batch_idx, (input, target) in enumerate(loader):
+        for batch_idx, (index, input, target) in enumerate(loader):
 
             self.before_batch()
 
@@ -658,9 +736,11 @@ class DatasetPruner:
             if has_no_sync and not need_update:
                 with model.no_sync():
                     loss = _forward()
+                    loss = self.while_update(loss, index)
                     _backward(loss)
             else:
                 loss = _forward()
+                loss = self.while_update(loss, index)
                 _backward(loss)
 
             if not args.distributed:
@@ -808,7 +888,9 @@ class DatasetPruner:
 
         for epoch in range(self.start_epoch, self.num_epochs):
 
-            self.before_epoch(epoch)
+            train_indices = self.before_epoch(epoch)
+
+            self.create_pruned_loader(train_indices)
 
             if hasattr(self.train_dataset, 'set_epoch'):
                 self.train_dataset.set_epoch(epoch)
@@ -872,7 +954,7 @@ class DatasetPruner:
                     eval_metrics,
                     filename=os.path.join(self.output_dir, 'summary.csv'),
                     lr=sum(lrs) / len(lrs),
-                    write_header=best_metric is None,
+                    write_header=self.best_metric is None,
                     log_wandb=self.args.log_wandb and self.has_wandb,
                 )
 
@@ -883,24 +965,24 @@ class DatasetPruner:
 
             if self.saver is not None:
                 # save proper checkpoint with eval metric
-                best_metric, best_epoch = self.saver.save_checkpoint(epoch, metric=latest_metric)
+                self.best_metric, self.best_epoch = self.saver.save_checkpoint(epoch, metric=latest_metric)
 
             if self.lr_scheduler is not None:
                 # step LR for next epoch
                 self.lr_scheduler.step(epoch + 1, latest_metric)
 
-            results.append({
+            self.results.append({
                 'epoch': epoch,
                 'train': train_metrics,
                 'validation': eval_metrics,
             })
 
-            self.after_epoch()
+            self.after_epoch(epoch)
 
         self.after_run()
 
-        results = {'all': results}
+        self.results = {'all': self.results}
         if self.best_metric is not None:
-            results['best'] = results['all'][self.best_epoch - self.start_epoch]
+            self.results['best'] = self.results['all'][self.best_epoch - self.start_epoch]
             self.logger.info('*** Best metric: {0} (epoch {1})'.format(self.best_metric, self.best_epoch))
-        print(f'--result\n{json.dumps(results, indent=4)}')
+        print(f'--result\n{json.dumps(self.results, indent=4)}')

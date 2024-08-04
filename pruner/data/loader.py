@@ -1,79 +1,49 @@
-""" Loader Factory, Fast Collate, CUDA Prefetcher
-
-Prefetcher and Fast Collate inspired by NVIDIA APEX example at
-https://github.com/NVIDIA/apex/commit/d5e2bb4bdeedd27b1dfaf5bb2b24d6c000dee9be#diff-cf86c282ff7fba81fad27a559379d5bf
-
-Hacked together by / Copyright 2019, Ross Wightman
-"""
-import logging
-import random
-from contextlib import suppress
-from functools import partial
-from itertools import repeat
-from typing import Callable, Optional, Tuple, Union
-
 import torch
-import torch.utils.data
 import numpy as np
 
-from .constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from .dataset import IterableImageDataset, ImageDataset
-from .distributed_sampler import OrderedDistributedSampler, RepeatAugSampler
-from .random_erasing import RandomErasing
-from .mixup import FastCollateMixup
-from .transforms_factory import create_transform
+from contextlib import suppress
+from functools import partial
+from typing import Callable, Optional, Tuple, Union
 
-_logger = logging.getLogger(__name__)
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from timm.data.dataset import IterableImageDataset, ImageDataset
+from timm.data.transforms_factory import create_transform
+
+from timm.data.loader import RepeatAugSampler, MultiEpochsDataLoader, OrderedDistributedSampler, _worker_init
+from timm.data.loader import fast_collate as fast_collate_for_input_target
+from timm.data.loader import PrefetchLoader as InputTargetPrefetchLoader
 
 
-def fast_collate(batch):
-    """ A fast collation function optimized for uint8 images (np array or torch) and int64 targets (labels)"""
+def fast_collate_for_index_input_target(batch):
+    '''
+    fast_collate function for (index, input, target) data tuple
+    '''
+
     assert isinstance(batch[0], tuple)
     batch_size = len(batch)
-    if isinstance(batch[0][0], tuple):
-        # This branch 'deinterleaves' and flattens tuples of input tensors into one tensor ordered by position
-        # such that all tuple of position n will end up in a torch.split(tensor, batch_size) in nth position
-        inner_tuple_size = len(batch[0][0])
-        flattened_batch_size = batch_size * inner_tuple_size
-        targets = torch.zeros(flattened_batch_size, dtype=torch.int64)
-        tensor = torch.zeros((flattened_batch_size, *batch[0][0][0].shape), dtype=torch.uint8)
-        for i in range(batch_size):
-            assert len(batch[i][0]) == inner_tuple_size  # all input tensor tuples must be same length
-            for j in range(inner_tuple_size):
-                targets[i + j * batch_size] = batch[i][1]
-                tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
-        return tensor, targets
-    elif isinstance(batch[0][0], np.ndarray):
-        targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
+
+    numpy_array = np.array([b[0] for b in batch])
+    indices = torch.tensor(numpy_array, dtype=torch.int64)
+
+    if isinstance(batch[0][1], np.ndarray):
+        targets = torch.tensor([b[2] for b in batch], dtype=torch.int64)
         assert len(targets) == batch_size
-        tensor = torch.zeros((batch_size, *batch[0][0].shape), dtype=torch.uint8)
+        tensor = torch.zeros((batch_size, *batch[0][1].shape), dtype=torch.uint8)
         for i in range(batch_size):
-            tensor[i] += torch.from_numpy(batch[i][0])
-        return tensor, targets
-    elif isinstance(batch[0][0], torch.Tensor):
-        targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
+            tensor[i] += torch.from_numpy(batch[i][1])
+        return indices, tensor, targets
+    elif isinstance(batch[0][1], torch.Tensor):
+        targets = torch.tensor([b[2] for b in batch], dtype=torch.int64)
         assert len(targets) == batch_size
-        tensor = torch.zeros((batch_size, *batch[0][0].shape), dtype=torch.uint8)
+        tensor = torch.zeros((batch_size, *batch[0][1].shape), dtype=torch.uint8)
         for i in range(batch_size):
-            tensor[i].copy_(batch[i][0])
-        return tensor, targets
+            tensor[i].copy_(batch[i][1])
+        return indices, tensor, targets
     else:
         assert False
 
 
-def adapt_to_chs(x, n):
-    if not isinstance(x, (tuple, list)):
-        x = tuple(repeat(x, n))
-    elif len(x) != n:
-        x_mean = np.mean(x).item()
-        x = (x_mean,) * n
-        _logger.warning(f'Pretrained mean/std different shape than model, using avg value {x}.')
-    else:
-        assert len(x) == n, 'normalization stats must match image channels'
-    return x
-
-
-class PrefetchLoader:
+class IndexInputTargetPrefetchLoader(InputTargetPrefetchLoader):
 
     def __init__(
             self,
@@ -88,33 +58,20 @@ class PrefetchLoader:
             re_mode='const',
             re_count=1,
             re_num_splits=0):
-
-        mean = adapt_to_chs(mean, channels)
-        std = adapt_to_chs(std, channels)
-        normalization_shape = (1, channels, 1, 1)
-
-        self.loader = loader
-        self.device = device
-        if fp16:
-            # fp16 arg is deprecated, but will override dtype arg if set for bwd compat
-            img_dtype = torch.float16
-        self.img_dtype = img_dtype
-        self.mean = torch.tensor(
-            [x * 255 for x in mean], device=device, dtype=img_dtype).view(normalization_shape)
-        self.std = torch.tensor(
-            [x * 255 for x in std], device=device, dtype=img_dtype).view(normalization_shape)
-        if re_prob > 0.:
-            self.random_erasing = RandomErasing(
-                probability=re_prob,
-                mode=re_mode,
-                max_count=re_count,
-                num_splits=re_num_splits,
-                device=device,
-            )
-        else:
-            self.random_erasing = None
-        self.is_cuda = torch.cuda.is_available() and device.type == 'cuda'
-
+        
+        super(IndexInputTargetPrefetchLoader, self).__init__(
+            loader,
+            mean=mean,
+            std=std,
+            channels=channels,
+            device=device,
+            img_dtype=img_dtype,
+            fp16=fp16,
+            re_prob=re_prob,
+            re_mode=re_mode,
+            re_count=re_count,
+            re_num_splits=re_num_splits)
+        
     def __iter__(self):
         first = True
         if self.is_cuda:
@@ -124,7 +81,7 @@ class PrefetchLoader:
             stream = None
             stream_context = suppress
 
-        for next_input, next_target in self.loader:
+        for next_index, next_input, next_target in self.loader:
 
             with stream_context():
                 next_input = next_input.to(device=self.device, non_blocking=True)
@@ -134,56 +91,19 @@ class PrefetchLoader:
                     next_input = self.random_erasing(next_input)
 
             if not first:
-                yield input, target
+                yield index, input, target
             else:
                 first = False
 
             if stream is not None:
                 torch.cuda.current_stream().wait_stream(stream)
-
+            
+            index = next_index
             input = next_input
             target = next_target
 
-        yield input, target
+        yield index, input, target
 
-    def __len__(self):
-        return len(self.loader)
-
-    @property
-    def sampler(self):
-        return self.loader.sampler
-
-    @property
-    def dataset(self):
-        return self.loader.dataset
-
-    @property
-    def mixup_enabled(self):
-        if isinstance(self.loader.collate_fn, FastCollateMixup):
-            return self.loader.collate_fn.mixup_enabled
-        else:
-            return False
-
-    @mixup_enabled.setter
-    def mixup_enabled(self, x):
-        if isinstance(self.loader.collate_fn, FastCollateMixup):
-            self.loader.collate_fn.mixup_enabled = x
-
-
-def _worker_init(worker_id, worker_seeding='all'):
-    worker_info = torch.utils.data.get_worker_info()
-    assert worker_info.id == worker_id
-    if isinstance(worker_seeding, Callable):
-        seed = worker_seeding(worker_info)
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed % (2 ** 32 - 1))
-    else:
-        assert worker_seeding in ('all', 'part')
-        # random / torch seed already called in dataloader iter class w/ worker_info.seed
-        # to reproduce some old results (same seed + hparam combo), partial seeding is required (skip numpy re-seed)
-        if worker_seeding == 'all':
-            np.random.seed(worker_info.seed % (2 ** 32 - 1))
 
 
 def create_loader(
@@ -325,8 +245,24 @@ def create_loader(
     else:
         assert num_aug_repeats == 0, "RepeatAugment not currently supported in non-distributed or IterableDataset use"
 
+    # if collate_fn is None:
+    #     collate_fn = fast_collate if use_prefetcher else torch.utils.data.dataloader.default_collate
+
+    if len(list(dataset[0])) == 2:
+        has_index = False
+    elif len(list(dataset[0])) == 3:
+        has_index = True
+    else:
+        raise ValueError
+
     if collate_fn is None:
-        collate_fn = fast_collate if use_prefetcher else torch.utils.data.dataloader.default_collate
+        if use_prefetcher:
+            if has_index:
+                collate_fn = fast_collate_for_index_input_target
+            else:
+                collate_fn = fast_collate_for_input_target
+        else:
+            collate_fn = torch.utils.data.dataloader.default_collate
 
     loader_class = torch.utils.data.DataLoader
     if use_multi_epochs_loader:
@@ -350,53 +286,34 @@ def create_loader(
         loader = loader_class(dataset, **loader_args)
     if use_prefetcher:
         prefetch_re_prob = re_prob if is_training and not no_aug else 0.
-        loader = PrefetchLoader(
-            loader,
-            mean=mean,
-            std=std,
-            channels=input_size[0],
-            device=device,
-            fp16=fp16,  # deprecated, use img_dtype
-            img_dtype=img_dtype,
-            re_prob=prefetch_re_prob,
-            re_mode=re_mode,
-            re_count=re_count,
-            re_num_splits=re_num_splits
-        )
+        if has_index:
+            loader = IndexInputTargetPrefetchLoader(
+                loader,
+                mean=mean,
+                std=std,
+                channels=input_size[0],
+                device=device,
+                fp16=fp16,  # deprecated, use img_dtype
+                img_dtype=img_dtype,
+                re_prob=prefetch_re_prob,
+                re_mode=re_mode,
+                re_count=re_count,
+                re_num_splits=re_num_splits
+            )
+        else:
+            loader = InputTargetPrefetchLoader(
+                loader,
+                mean=mean,
+                std=std,
+                channels=input_size[0],
+                device=device,
+                fp16=fp16,  # deprecated, use img_dtype
+                img_dtype=img_dtype,
+                re_prob=prefetch_re_prob,
+                re_mode=re_mode,
+                re_count=re_count,
+                re_num_splits=re_num_splits
+            )
 
     return loader
-
-
-class MultiEpochsDataLoader(torch.utils.data.DataLoader):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._DataLoader__initialized = False
-        if self.batch_sampler is None:
-            self.sampler = _RepeatSampler(self.sampler)
-        else:
-            self.batch_sampler = _RepeatSampler(self.batch_sampler)
-        self._DataLoader__initialized = True
-        self.iterator = super().__iter__()
-
-    def __len__(self):
-        return len(self.sampler) if self.batch_sampler is None else len(self.batch_sampler.sampler)
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield next(self.iterator)
-
-
-class _RepeatSampler(object):
-    """ Sampler that repeats forever.
-
-    Args:
-        sampler (Sampler)
-    """
-
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-    def __iter__(self):
-        while True:
-            yield from iter(self.sampler)
+    

@@ -7,6 +7,7 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from timm import utils
 
 from pruner.dataset_pruner import DatasetPruner
+from pruner.infobatch import InfoBatch
 
 
 try:
@@ -330,7 +331,7 @@ group.add_argument('--seed', type=int, default=42, metavar='S',
                    help='random seed (default: 42)')
 group.add_argument('--worker-seeding', type=str, default='all',
                    help='worker seed mode (default: all)')
-group.add_argument('--log-interval', type=int, default=50, metavar='N',
+group.add_argument('--log-interval', type=int, default=500, metavar='N',
                    help='how many batches to wait before logging training status')
 group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
@@ -357,9 +358,37 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
 
+# Dataset Pruning Common Hyperparameters
+group = parser.add_argument_group('Dataset Pruning')
+group.add_argument('--pruning-ratio', type=float, default=0.5,
+                   help='dataset pruning ratio (default: 0.5)')
+group.add_argument('--rescaling', action='store_true', default=False,
+                   help='apply gradient rescaling')
+group.add_argument('--pruning_start_epoch', type=int, default=0,
+                   help='pruning start epoch (default: 0)')
+group.add_argument('--pruning_end_epoch', type=int, default=78,
+                   help='pruning end epoch (default: 78)')
+
+# InfoBatch Hyperparameters
+group.add_argument('--multiplier', type=float, default=1.0,
+                   help='dataset mean multiplier (default: 1.0)')
+
+# InfoLoss Hyperparameters
+group.add_argument('--threshold', type=float, default=2.5,
+                   help='soft pruning threshold multiplier (default: 2.5)')
+
+
 
 def main():
-    exp = DatasetPruner(
+    # exp = DatasetPruner(
+    #         logger=_logger,
+    #         config_parser=config_parser,
+    #         parser=parser,
+    #         has_apex=has_apex,
+    #         has_native_amp=has_native_amp,
+    #         has_compile=has_compile,
+    #         has_wandb=has_wandb)
+    exp = InfoBatch(
             logger=_logger,
             config_parser=config_parser,
             parser=parser,
