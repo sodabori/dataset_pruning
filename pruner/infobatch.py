@@ -43,7 +43,13 @@ class InfoBatch(DatasetPruner):
         # select samples for this epoch
         if epoch <= self.pruning_start_epoch:
             pruned_samples = np.arange(self.num_train_samples)
-            augment_samples = []
+            
+            if self.args.augment_method == 'none':
+                augment_samples = []
+            elif self.args.augment_method == 'well':
+                augment_samples = []
+            elif self.args.augment_method == 'all':
+                augment_samples = pruned_samples
 
         elif epoch >= self.pruning_end_epoch:
             pruned_samples = augment_samples = np.arange(self.num_train_samples)

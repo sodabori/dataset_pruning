@@ -30,4 +30,5 @@ CUDA_VISIBLE_DEVICES=${DEVICE} python main.py \
     --pruning-ratio ${RATIO} \
     --augment-method ${AUGMENT_METHOD} \
     --rescaling \
+    --log-wandb \
 
