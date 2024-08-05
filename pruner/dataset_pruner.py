@@ -583,6 +583,8 @@ class DatasetPruner:
                 self.logger.warning(
                     "You've requested to log metrics to wandb but package not found. "
                     "Metrics not being logged to wandb, try `pip install wandb`")
+
+        self.has_wandb = has_wandb
         
         return decreasing_metric
 
