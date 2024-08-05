@@ -25,7 +25,7 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 
-from .data.indexed_dataset import get_indexed_dataset
+from .data.indexed_dataset import convert_to_index_dataset
 from .data.loader import create_loader
 
 
@@ -34,17 +34,21 @@ class DatasetPruner:
     def __init__(
             self,
             logger,
-            config_parser,
-            parser,
+            args,
+            args_text,
             has_apex,
             has_native_amp,
             has_compile,
             has_wandb):
+
+        start_time = time.time()
         
+        self.args = args
         self.logger = logger
 
+        self.exp_name = self.get_experiment_name()
+
         utils.setup_default_logging()
-        self.args, args_text = self._parse_args(config_parser, parser)
 
         if self.args.device_modules:
             for module in self.args.device_modules:
@@ -126,25 +130,57 @@ class DatasetPruner:
 
         # dataset pruning statistics
         self.num_used_samples = 0
+        self.num_augment_samples = 0
         self.num_full_samples = 0
         self.num_train_samples = len(self.train_dataset)
+
+        self.scores = None
+
+        self.total_time = time.time() - start_time
+
     
+    def get_experiment_name(self):
+        name = ''
 
-    def _parse_args(self, config_parser, parser):
-        # Do we have a config file to parse?
-        args_config, remaining = config_parser.parse_known_args()
-        if args_config.config:
-            with open(args_config.config, 'r') as f:
-                cfg = yaml.safe_load(f)
-                parser.set_defaults(**cfg)
+        # method info
+        name += self.args.pruning_method + '_'
 
-        # The main arg parser parses the rest of the args, the usual
-        # defaults will have been overridden if config file specified.
-        args = parser.parse_args(remaining)
+        # dataset info
+        dataset_name = self.args.dataset
 
-        # Cache the args as a text string to save them in the output dir later
-        args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-        return args, args_text
+        if '/' in dataset_name:
+            dataset_name = dataset_name.split('/')[-1]
+        name += dataset_name + '_'
+
+        # model info
+        name += self.args.model + '_'
+
+        if self.args.pruning_method != 'full':
+            # pruning ratio info
+            name += 'ratio_' + str(self.args.pruning_ratio) + '_'
+
+            # multiplier info (for infobatch)
+            if self.args.pruning_method == 'infobatch':
+                name += 'multiplier_' + str(self.args.multiplier) + '_'
+
+            # gradient scaling info
+            name += 'rescaling_'
+            if self.args.rescaling:
+                name += 'o_'
+            else:
+                name += 'x_'                
+
+        # augmentation info
+        name += 'augment_method_' + self.args.augment_method + '_'
+
+        # seed info
+        name += 'seed_' + str(self.args.seed) + '_'
+
+        # time info
+        name += str(datetime.now().strftime("%Y%m%d%H%M%S"))
+
+        return name
+    
 
     def resolve_amp_arguments(self, has_apex, has_native_amp):
         use_amp = None
@@ -204,7 +240,7 @@ class DatasetPruner:
         self.num_aug_splits = 0
         if self.args.aug_splits > 0:
             assert self.args.aug_splits > 1, 'A split of 1 makes no sense'
-            num_aug_splits = self.args.aug_splits
+            self.num_aug_splits = self.args.aug_splits
 
         # enable split bn (separate bn stats per batch-portion)
         if self.args.split_bn:
@@ -367,7 +403,10 @@ class DatasetPruner:
 
         train_dataset = create_dataset(*args, **kwargs)
 
-        self.train_dataset = get_indexed_dataset(train_dataset, *args, **kwargs)
+        # self.train_dataset = get_indexed_dataset(train_dataset, *args, **kwargs)
+        self.train_dataset = convert_to_index_dataset(train_dataset, self.args.init_augment, **kwargs)
+
+        self.augment_indices = self.train_dataset.augment_indices
 
         if self.args.val_split:
             self.val_dataset = create_dataset(
@@ -412,9 +451,11 @@ class DatasetPruner:
             dataset_train = AugMixDataset(dataset_train, num_splits=self.num_aug_splits)
 
     def create_data_loaders_with_augmentation_pipeline(self):
+
         train_interpolation = self.args.train_interpolation
         if self.args.no_aug or not train_interpolation:
             train_interpolation = self.data_config['interpolation']
+
         self.train_loader = create_loader(
             self.train_dataset,
             input_size=self.data_config['input_size'],
@@ -448,6 +489,7 @@ class DatasetPruner:
             use_prefetcher=self.args.prefetcher,
             use_multi_epochs_loader=self.args.use_multi_epochs_loader,
             worker_seeding=self.args.worker_seeding,
+            augment_indices=self.augment_indices,
         )
 
         self.val_loader = None
@@ -496,7 +538,7 @@ class DatasetPruner:
                     pos_weight=self.args.bce_pos_weight,
                 )
             else:
-                self.train_loss_fn = LabelSmoothingCrossEntropy(smoothing=self.args.smoothing)
+                self.train_loss_fn = LabelSmoothingCrossEntropy(smoothing=self.args.smoothing, reduction='none')
         else:
             self.train_loss_fn = nn.CrossEntropyLoss(reduction='none')
         self.train_loss_fn = self.train_loss_fn.to(device=self.device)
@@ -512,7 +554,7 @@ class DatasetPruner:
         self.output_dir = None
         if utils.is_primary(self.args):
             if self.args.experiment:
-                exp_name = self.args.experiment
+                exp_name = self.args.experiment + '_' + self.exp_name
             else:
                 exp_name = '-'.join([
                     datetime.now().strftime("%Y%m%d-%H%M%S"),
@@ -536,7 +578,7 @@ class DatasetPruner:
 
         if utils.is_primary(self.args) and self.args.log_wandb:
             if has_wandb:
-                wandb.init(project=self.args.experiment, config=self.args)
+                wandb.init(project=self.args.experiment, name=self.exp_name, config=self.args)
             else:
                 self.logger.warning(
                     "You've requested to log metrics to wandb but package not found. "
@@ -545,7 +587,6 @@ class DatasetPruner:
         return decreasing_metric
 
     def set_learning_rate_schedule_and_starting_epoch(self, decreasing_metric, resume_epoch):
-        
         self.updates_per_epoch = (len(self.train_loader) + self.args.grad_accum_steps - 1) // self.args.grad_accum_steps
         self.lr_scheduler, self.num_epochs = create_scheduler_v2(
             self.optimizer,
@@ -578,9 +619,13 @@ class DatasetPruner:
     def before_epoch(self, epoch):
         
         self.num_used_samples += self.num_train_samples
+        self.num_augment_samples += 0 if self.augment_indices is None else len(self.augment_indices)
         self.num_full_samples += self.num_train_samples
 
-        return None
+        return {
+            'train': None,
+            'augment': None,
+        }
 
     def after_epoch(self, epoch):
         pass
@@ -595,12 +640,13 @@ class DatasetPruner:
         loss = torch.mean(loss)
         return loss
 
-    def create_pruned_loader(self, train_indices=None):
+    def create_pruned_loader(self, train_indices=None, augment_indices=None):
 
         if train_indices is None:
             pruned_dataset = self.train_dataset
         else:
             pruned_dataset = torch.utils.data.Subset(self.train_dataset, train_indices)
+            pruned_dataset.augment_indices = set(augment_indices)
 
         train_interpolation = self.args.train_interpolation
         if self.args.no_aug or not train_interpolation:
@@ -638,6 +684,7 @@ class DatasetPruner:
             use_prefetcher=self.args.prefetcher,
             use_multi_epochs_loader=self.args.use_multi_epochs_loader,
             worker_seeding=self.args.worker_seeding,
+            augment_indices=self.augment_indices,
         )
 
     def train_one_epoch(
@@ -807,7 +854,10 @@ class DatasetPruner:
         if hasattr(self.optimizer, 'sync_lookahead'):
             optimizer.sync_lookahead()
 
-        return OrderedDict([('loss', losses_m.avg)])
+        return OrderedDict([
+            ('loss', losses_m.avg),
+            ('lr', lr)
+        ])
 
 
     def validate(
@@ -888,10 +938,24 @@ class DatasetPruner:
 
         for epoch in range(self.start_epoch, self.num_epochs):
 
-            train_indices = self.before_epoch(epoch)
+            # dataset preprocessing
+            start_time = time.time()
+            epoch_indices = self.before_epoch(epoch)
 
-            self.create_pruned_loader(train_indices)
+            self.create_pruned_loader(
+                train_indices=epoch_indices['train'],
+                augment_indices=epoch_indices['augment'])
+            dpp_time = time.time() - start_time
+            
+            # save epoch-wise infomation
+            self.save_sample_info(
+                epoch=epoch,
+                scores=self.scores,
+                train_indices=epoch_indices['train'],
+                augment_indices=epoch_indices['augment'])
 
+            # training
+            start_time = time.time()
             if hasattr(self.train_dataset, 'set_epoch'):
                 self.train_dataset.set_epoch(epoch)
             elif self.args.distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
@@ -918,6 +982,21 @@ class DatasetPruner:
                 if utils.is_primary(self.args):
                     self.logger.info("Distributing BatchNorm running means and vars")
                 utils.distribute_bn(self.model, self.args.world_size, self.args.dist_bn == 'reduce')
+
+            train_time = time.time() - start_time
+
+            # add train metrics
+            if utils.is_primary(self.args):
+                self.total_time += dpp_time + train_time
+                train_metrics['dataset_preprocessing_time'] = dpp_time
+                train_metrics['train_time'] = train_time
+                train_metrics['epoch_time'] = dpp_time + train_time
+                train_metrics['total_time'] = self.total_time
+
+                train_metrics['num_train_samples'] = len(epoch_indices['train'])
+                train_metrics['num_augmented_samples'] = len(epoch_indices['augment'])
+                train_metrics['data_utilization'] = self.num_used_samples / self.num_full_samples * 100
+                train_metrics['augmentation_utilization'] = self.num_augment_samples / self.num_full_samples * 100
 
             if self.val_loader is not None:
                 eval_metrics = self.validate(
@@ -986,3 +1065,28 @@ class DatasetPruner:
             self.results['best'] = self.results['all'][self.best_epoch - self.start_epoch]
             self.logger.info('*** Best metric: {0} (epoch {1})'.format(self.best_metric, self.best_epoch))
         print(f'--result\n{json.dumps(self.results, indent=4)}')
+
+
+    def save_sample_info(self, epoch, scores, train_indices, augment_indices):
+        # save epcoh-wise score information
+        # save epoch-wise used training sample indices
+        # save epoch-wise used augmentation sample indices
+        root = os.path.join(self.output_dir, 'pruning')
+        os.makedirs(root, exist_ok=True)
+
+        score_logger = os.path.join(root, f'score_epoch_{epoch}.json')
+        sample_logger = os.path.join(root, f'sample_epoch_{epoch}.json')
+        augment_logger = os.path.join(root, f'augment_epoch_{epoch}.json')
+
+        scores = [float(score) for score in self.scores]
+        sample_indices = [int(sample) for sample in train_indices]
+        augment_indices = [int(sample) for sample in augment_indices]
+
+        with open(score_logger, 'w') as f:
+            json.dump(scores, f)
+
+        with open(sample_logger, 'w') as f:
+            json.dump(sample_indices, f)
+
+        with open(augment_logger, 'w') as f:
+            json.dump(augment_indices, f)

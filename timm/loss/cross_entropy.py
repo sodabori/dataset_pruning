@@ -11,11 +11,12 @@ import torch.nn.functional as F
 class LabelSmoothingCrossEntropy(nn.Module):
     """ NLL loss with label smoothing.
     """
-    def __init__(self, smoothing=0.1):
+    def __init__(self, smoothing=0.1, reduction='mean'):
         super(LabelSmoothingCrossEntropy, self).__init__()
         assert smoothing < 1.0
         self.smoothing = smoothing
         self.confidence = 1. - smoothing
+        self.reduction = reduction
 
     def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         logprobs = F.log_softmax(x, dim=-1)
@@ -23,7 +24,12 @@ class LabelSmoothingCrossEntropy(nn.Module):
         nll_loss = nll_loss.squeeze(1)
         smooth_loss = -logprobs.mean(dim=-1)
         loss = self.confidence * nll_loss + self.smoothing * smooth_loss
-        return loss.mean()
+        if self.reduction == 'none':
+            return loss.mean()
+        elif self.reduction == 'mean':
+            return loss
+        else:
+            raise ValueError
 
 
 class SoftTargetCrossEntropy(nn.Module):

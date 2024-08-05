@@ -7,16 +7,16 @@ from .dataset_pruner import DatasetPruner
 class InfoBatch(DatasetPruner):
     def __init__(self,
             logger,
-            config_parser,
-            parser,
+            args,
+            args_text,
             has_apex,
             has_native_amp,
             has_compile,
             has_wandb):
         super(InfoBatch, self).__init__(
             logger,
-            config_parser,
-            parser,
+            args,
+            args_text,
             has_apex,
             has_native_amp,
             has_compile,
@@ -41,7 +41,14 @@ class InfoBatch(DatasetPruner):
     def before_epoch(self, epoch):
 
         # select samples for this epoch
-        if epoch > self.pruning_start_epoch and epoch < self.pruning_end_epoch:
+        if epoch <= self.pruning_start_epoch:
+            pruned_samples = np.arange(self.num_train_samples)
+            augment_samples = []
+
+        elif epoch >= self.pruning_end_epoch:
+            pruned_samples = augment_samples = np.arange(self.num_train_samples)
+
+        else:
             b = self.scores < (self.scores.mean() * self.multiplier)
             well_learned_samples = np.where(b)[0]
 
@@ -54,17 +61,25 @@ class InfoBatch(DatasetPruner):
                 self.weights[selected]=1/self.ratio
                 pruned_samples.extend(selected)
 
-        else:
-            pruned_samples = np.arange(self.num_train_samples)
+            if self.args.augment_method == 'none':
+                augment_samples = []
+            elif self.args.augment_method == 'well':
+                augment_samples = selected
+            elif self.args.augment_method == 'all':
+                augment_samples = pruned_samples
+            else:
+                raise NotImplementedError
 
         self.num_used_samples += len(pruned_samples)
+        self.num_augment_samples += len(augment_samples)
         self.num_full_samples += self.num_train_samples
 
-        print("scores: ", self.scores)
-        # print("pruned_samples: ", pruned_samples)
-        self.logger.info(f"Train:{epoch:2d} Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%)")
+        self.logger.info(f"Train:{epoch:2d} Train Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%) Augmentation Data Utilization: {self.num_augment_samples}/{self.num_full_samples} ({self.num_augment_samples/self.num_full_samples*100:.3f}%)")
 
-        return pruned_samples
+        return {
+            'train': pruned_samples,
+            'augment': augment_samples
+        }
     
 
     def while_update(self, loss, indexes):

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import yaml
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
@@ -7,6 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from timm import utils
 
 from pruner.dataset_pruner import DatasetPruner
+from pruner.full import Full
 from pruner.infobatch import InfoBatch
 
 
@@ -331,7 +333,7 @@ group.add_argument('--seed', type=int, default=42, metavar='S',
                    help='random seed (default: 42)')
 group.add_argument('--worker-seeding', type=str, default='all',
                    help='worker seed mode (default: all)')
-group.add_argument('--log-interval', type=int, default=500, metavar='N',
+group.add_argument('--log-interval', type=int, default=1000, metavar='N',
                    help='how many batches to wait before logging training status')
 group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
@@ -360,6 +362,9 @@ group.add_argument('--log-wandb', action='store_true', default=False,
 
 # Dataset Pruning Common Hyperparameters
 group = parser.add_argument_group('Dataset Pruning')
+parser.add_argument('--pruning-method', type=str, default='infobatch',
+                    help='pruning method (full / infobatch)')
+
 group.add_argument('--pruning-ratio', type=float, default=0.5,
                    help='dataset pruning ratio (default: 0.5)')
 group.add_argument('--rescaling', action='store_true', default=False,
@@ -368,6 +373,11 @@ group.add_argument('--pruning_start_epoch', type=int, default=0,
                    help='pruning start epoch (default: 0)')
 group.add_argument('--pruning_end_epoch', type=int, default=78,
                    help='pruning end epoch (default: 78)')
+parser.add_argument('--augment-method', default='none',
+                    help='augment method (none / well / all)')
+
+parser.add_argument('--init-augment', type=str, default='all',
+                    help='initial augment indices (none / all)')
 
 # InfoBatch Hyperparameters
 group.add_argument('--multiplier', type=float, default=1.0,
@@ -379,23 +389,42 @@ group.add_argument('--threshold', type=float, default=2.5,
 
 
 
+def _parse_args(config_parser, parser):
+    # Do we have a config file to parse?
+    args_config, remaining = config_parser.parse_known_args()
+    if args_config.config:
+        with open(args_config.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            parser.set_defaults(**cfg)
+
+    # The main arg parser parses the rest of the args, the usual
+    # defaults will have been overridden if config file specified.
+    args = parser.parse_args(remaining)
+
+    # Cache the args as a text string to save them in the output dir later
+    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
+    return args, args_text
+
+
 def main():
-    # exp = DatasetPruner(
-    #         logger=_logger,
-    #         config_parser=config_parser,
-    #         parser=parser,
-    #         has_apex=has_apex,
-    #         has_native_amp=has_native_amp,
-    #         has_compile=has_compile,
-    #         has_wandb=has_wandb)
-    exp = InfoBatch(
+    args, args_text = _parse_args(config_parser, parser)
+
+    if args.pruning_method == 'full':
+        Pruner = Full
+    elif args.pruning_method == 'infobatch':
+        Pruner = InfoBatch
+    else:
+        raise NotImplementedError
+
+    exp = Pruner(
             logger=_logger,
-            config_parser=config_parser,
-            parser=parser,
+            args=args,
+            args_text=args_text,
             has_apex=has_apex,
             has_native_amp=has_native_amp,
             has_compile=has_compile,
             has_wandb=has_wandb)
+    
     exp.run()
 
 if __name__ == '__main__':
