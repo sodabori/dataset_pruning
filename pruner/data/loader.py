@@ -238,10 +238,30 @@ def create_loader(
         dataset.default_transform = create_transform(
             input_size,
             is_training=is_training,
-            no_aug=True,
-            interpolation=interpolation,
+            no_aug=no_aug,
+            train_crop_mode=None,
+            scale=[0.08, 1.0],
+            ratio=[3/4, 4/3],
+            hflip=0.5,
+            vflip=0.0,
+            color_jitter=0., # default 0.4 but for no augmentation
+            color_jitter_prob=None,
+            grayscale_prob=None,
+            gaussian_blur_prob=None,
+            auto_augment=None, # autoaugmentation is false
+            interpolation='random',
             mean=mean,
             std=std,
+            crop_pct=None,
+            crop_mode=None,
+            crop_border_pixels=None,
+            re_prob=0.0,
+            re_mode='pixel',
+            re_count=1,
+            re_num_splits=0,
+            tf_preprocessing=tf_preprocessing,
+            use_prefetcher=use_prefetcher,
+            separate=False,
         )
 
         dataset.augment_transform = create_transform(

@@ -40,7 +40,7 @@ class Full(DatasetPruner):
         self.num_augment_samples += len(augment_samples)
         self.num_full_samples += self.num_train_samples
 
-        self.logger.info(f"Train:{epoch:2d} Train Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%) Augmentation Data Utilization: {self.num_augment_samples}/{self.num_full_samples} ({self.num_augment_samples/self.num_full_samples*100:.3f}%)")
+        self.logger.info(f"Train:{epoch:3d} Train Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%) Augmentation Data Utilization: {self.num_augment_samples}/{self.num_full_samples} ({self.num_augment_samples/self.num_full_samples*100:.3f}%)")
 
         return {
             'train': pruned_samples,

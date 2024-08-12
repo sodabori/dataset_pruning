@@ -163,6 +163,15 @@ class DatasetPruner:
             if self.args.pruning_method == 'infobatch':
                 name += 'multiplier_' + str(self.args.multiplier) + '_'
 
+            elif self.args.pruning_method == 'infoloss':
+                name += 'threshold_' + str(self.args.threshold) + '_'
+
+            elif self.args.pruning_method == 'epsilon_greedy':
+                name += 'alpha_' + str(self.args.alpha) + '_' + 'epsilon_' + str(self.args.epsilon) + '_'
+
+            elif self.args.pruning_method == 'ucb':
+                name += 'alpha_' + str(self.args.alpha) + '_' + 'epsilon_' + str(self.args.epsilon) + 'confidence_' + str(self.args.confidence) + '_'
+
             # gradient scaling info
             name += 'rescaling_'
             if self.args.rescaling:
@@ -172,6 +181,10 @@ class DatasetPruner:
 
         # augmentation info
         name += 'augment_method_' + self.args.augment_method + '_'
+
+        if self.args.pruning_method == 'uniform':
+            name += 'augment_ratio_' + str(self.args.augment_ratio) + '_'
+
 
         # seed info
         name += 'seed_' + str(self.args.seed) + '_'
@@ -385,27 +398,10 @@ class DatasetPruner:
             'num_samples': self.args.train_num_samples,
         }
 
-        # train_dataset = create_dataset(
-        #     self.args.dataset,
-        #     root=self.args.data_dir,
-        #     split=self.args.train_split,
-        #     is_training=True,
-        #     class_map=self.args.class_map,
-        #     download=self.args.dataset_download,
-        #     batch_size=self.args.batch_size,
-        #     seed=self.args.seed,
-        #     repeats=self.args.epoch_repeats,
-        #     input_img_mode=input_img_mode,
-        #     input_key=self.args.input_key,
-        #     target_key=self.args.target_key,
-        #     num_samples=self.args.train_num_samples,
-        # )
-
         train_dataset = create_dataset(*args, **kwargs)
 
         # self.train_dataset = get_indexed_dataset(train_dataset, *args, **kwargs)
         self.train_dataset = convert_to_index_dataset(train_dataset, self.args.init_augment, **kwargs)
-
         self.augment_indices = self.train_dataset.augment_indices
 
         if self.args.val_split:
@@ -451,6 +447,8 @@ class DatasetPruner:
             dataset_train = AugMixDataset(dataset_train, num_splits=self.num_aug_splits)
 
     def create_data_loaders_with_augmentation_pipeline(self):
+
+        # print('self.augment_indices in create_data_loaders: ', self.augment_indices)
 
         train_interpolation = self.args.train_interpolation
         if self.args.no_aug or not train_interpolation:
@@ -619,15 +617,7 @@ class DatasetPruner:
         pass
 
     def before_epoch(self, epoch):
-        
-        self.num_used_samples += self.num_train_samples
-        self.num_augment_samples += 0 if self.augment_indices is None else len(self.augment_indices)
-        self.num_full_samples += self.num_train_samples
-
-        return {
-            'train': None,
-            'augment': None,
-        }
+        pass
 
     def after_epoch(self, epoch):
         pass
@@ -648,7 +638,7 @@ class DatasetPruner:
             pruned_dataset = self.train_dataset
         else:
             pruned_dataset = torch.utils.data.Subset(self.train_dataset, train_indices)
-            pruned_dataset.augment_indices = set(augment_indices)
+            self.train_dataset.augment_indices = pruned_dataset.augment_indices = self.augment_indices = set(augment_indices)
 
         train_interpolation = self.args.train_interpolation
         if self.args.no_aug or not train_interpolation:
@@ -936,6 +926,9 @@ class DatasetPruner:
 
     def run(self):
 
+        best_epoch = 0
+        best_acc1 = 0.
+
         self.before_run()
 
         for epoch in range(self.start_epoch, self.num_epochs):
@@ -1009,6 +1002,12 @@ class DatasetPruner:
                     device=self.device,
                     amp_autocast=self.amp_autocast,
                     log_suffix='')
+                
+                best_epoch = epoch if eval_metrics['top1'] > best_acc1 else best_epoch
+                best_acc1 = eval_metrics['top1'] if eval_metrics['top1'] > best_acc1 else best_acc1
+
+                eval_metrics['best_epoch'] = best_epoch
+                eval_metrics['best_acc1'] = best_acc1
 
                 if self.model_ema is not None and not self.args.model_ema_force_cpu:
                     if self.args.distributed and self.args.dist_bn in ('broadcast', 'reduce'):

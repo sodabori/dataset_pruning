@@ -10,6 +10,10 @@ from timm import utils
 from pruner.dataset_pruner import DatasetPruner
 from pruner.full import Full
 from pruner.infobatch import InfoBatch
+from pruner.infoloss import InfoLoss
+from pruner.uniform import Uniform
+from pruner.epsilon_greedy import EpsilonGreedy
+from pruner.ucb import UCB
 
 
 try:
@@ -367,11 +371,13 @@ parser.add_argument('--pruning-method', type=str, default='infobatch',
 
 group.add_argument('--pruning-ratio', type=float, default=0.5,
                    help='dataset pruning ratio (default: 0.5)')
+group.add_argument('--augment-ratio', type=float, default=0.1,
+                   help='dataset augment ratio for well option (default: 0.1)')
 group.add_argument('--rescaling', action='store_true', default=False,
                    help='apply gradient rescaling')
-group.add_argument('--pruning_start_epoch', type=int, default=0,
+group.add_argument('--pruning-start-epoch', type=int, default=0,
                    help='pruning start epoch (default: 0)')
-group.add_argument('--pruning_end_epoch', type=int, default=78,
+group.add_argument('--pruning-end-epoch', type=int, default=78,
                    help='pruning end epoch (default: 78)')
 parser.add_argument('--augment-method', default='none',
                     help='augment method (none / well / all)')
@@ -386,6 +392,20 @@ group.add_argument('--multiplier', type=float, default=1.0,
 # InfoLoss Hyperparameters
 group.add_argument('--threshold', type=float, default=2.5,
                    help='soft pruning threshold multiplier (default: 2.5)')
+
+# Epsilon Greedy & UCB
+group.add_argument('--num-epoch-per-selection', type=int, default=10,
+                   help='data selection period (default: 10)')
+group.add_argument('--replace', action='store_true', default=False,
+                   help='sampling with replace')
+group.add_argument('--epsilon', type=float, default=0.1,
+                   help='epsilon for epsilon greedy (default: 0.1)')
+group.add_argument('--alpha', type=float, default=0.8,
+                   help='alpha for epsilon greedy (default: 0.8)')
+group.add_argument('--confidence', type=float, default=1.0,
+                   help='confidence coefficient for ucb (default: 1.0)')
+
+
 
 
 
@@ -413,6 +433,14 @@ def main():
         Pruner = Full
     elif args.pruning_method == 'infobatch':
         Pruner = InfoBatch
+    elif args.pruning_method == 'infoloss':
+        Pruner = InfoLoss
+    elif args.pruning_method == 'uniform':
+        Pruner = Uniform
+    elif args.pruning_method == 'epsilon_greedy':
+        Pruner = EpsilonGreedy
+    elif args.pruning_method == 'ucb':
+        Pruner = UCB
     else:
         raise NotImplementedError
 

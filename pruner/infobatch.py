@@ -52,7 +52,14 @@ class InfoBatch(DatasetPruner):
                 augment_samples = pruned_samples
 
         elif epoch >= self.pruning_end_epoch:
-            pruned_samples = augment_samples = np.arange(self.num_train_samples)
+            pruned_samples = np.arange(self.num_train_samples)
+
+            if self.args.augment_method == 'none':
+                augment_samples = []
+            elif self.args.augment_method == 'well':
+                augment_samples = pruned_samples
+            elif self.args.augment_method == 'all':
+                augment_samples = pruned_samples
 
         else:
             b = self.scores < (self.scores.mean() * self.multiplier)
@@ -80,12 +87,23 @@ class InfoBatch(DatasetPruner):
         self.num_augment_samples += len(augment_samples)
         self.num_full_samples += self.num_train_samples
 
-        self.logger.info(f"Train:{epoch:2d} Train Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%) Augmentation Data Utilization: {self.num_augment_samples}/{self.num_full_samples} ({self.num_augment_samples/self.num_full_samples*100:.3f}%)")
+        self.logger.info(f"Train:{epoch:3d} Train Data Utilization: {self.num_used_samples}/{self.num_full_samples} ({self.num_used_samples/self.num_full_samples*100:.3f}%) Augmentation Data Utilization: {self.num_augment_samples}/{self.num_full_samples} ({self.num_augment_samples/self.num_full_samples*100:.3f}%)")
 
         return {
             'train': pruned_samples,
             'augment': augment_samples
         }
+
+    # def before_epoch(self, epoch): # For DEBUG
+
+    #     # select samples for this epoch
+    #     pruned_samples = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+    #     augment_samples = []
+
+    #     return {
+    #         'train': pruned_samples,
+    #         'augment': augment_samples
+    #     }
     
 
     def while_update(self, loss, indexes):

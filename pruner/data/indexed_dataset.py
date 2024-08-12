@@ -30,8 +30,10 @@ def convert_to_index_dataset(dataset, init_augment='all', **kwargs):
 
     def new_getitem(self, index):
         if index in self.augment_indices:
+            # print("augment")
             self.transform = self.augment_transform
         else:
+            # print("default")
             self.transform = self.default_transform
         
         data, label = super(IndexedDataset, self).__getitem__(index)

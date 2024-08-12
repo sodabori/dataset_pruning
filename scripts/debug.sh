@@ -1,22 +1,14 @@
 #!/bin/bash
-# bash ./scripts/debug.sh
+# bash ./scripts/debug.sh 0
 
+PROJECT=DEBUG
 
-# torchrun --nproc_per_node=4 main.py \
-#     --data-dir /SSD/ILSVRC2012 \
-#     --dataset imagenet \
-#     --model resnet18 \
-#     --sched cosine \
-#     --epochs 150 \
-#     --warmup-epochs 5 \
-#     --lr 0.4 \
-#     --reprob 0.5 \
-#     --remode pixel \
-#     --batch-size 256 \
-#     --amp \
-#     --workers 4 \
+DEVICE=${1}
+PRUNING_METHOD=infobatch
+RATIO=0.00001
+AUGMENT_METHOD=none
 
-CUDA_VISIBLE_DEVICES=0 python main.py \
+CUDA_VISIBLE_DEVICES=${DEVICE} python main.py \
     --data-dir /SSD/ILSVRC2012 \
     --dataset imagenet \
     --model resnet18 \
@@ -29,23 +21,10 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
     --lr 0.1 \
     --momentum 0.9 \
     --weight-decay 1e-4 \
-    --batch-size 32 \
-    --workers 4 \
-    --experiment 20240805_DEBUG \
-    --pruning-method full \
-    --augment-method all \
-
-
-# CUDA_VISIBLE_DEVICES=0 python main.py \
-#     --data-dir /SSD/CIFAR100 \
-#     --dataset torch/cifar100 \
-#     --model resnet18 \
-#     --sched cosine \
-#     --epochs 150 \
-#     --warmup-epochs 5 \
-#     --lr 0.4 \
-#     --reprob 0.5 \
-#     --remode pixel \
-#     --batch-size 32 \
-#     --workers 4 \
-
+    --batch-size 256 \
+    --workers 8 \
+    --experiment ${PROJECT} \
+    --pruning-method ${PRUNING_METHOD} \
+    --pruning-ratio ${RATIO} \
+    --augment-method ${AUGMENT_METHOD} \
+    --aa rand-m9-mstd0.5 \
